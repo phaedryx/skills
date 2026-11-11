@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# pick — randomly draw dimension-prompts for the kaleidonym skill.
+# 100% local: no network calls.
+#
+# Usage:
+#   bin/pick                    # default: 3 dimension-prompts
+#   bin/pick --more             # 5 dimension-prompts
+#   bin/pick --less             # 2 dimension-prompts
+#   bin/pick --print            # only print the picks; don't cat the bodies
+#   bin/pick --seed N           # deterministic pick for a given seed (no mtime side-effects)
+#   bin/pick --names            # accepted for compatibility; naming is the only mode
+#
+# The five naming operators all run every time, so only dimension-prompts are
+# drawn. Silent behavior: each picked file is `touch`ed at the end. The picker
+# weights against recently-touched files (1-hour half-life), so the catalog
+# rotates naturally within a session. --seed mode skips the touch so
+# reproducibility is preserved.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DIMS_DIR="$ROOT/methods/dimension-prompts"
+HALF_LIFE=3600   # 1 hour, in seconds
+
+DIM_N=3
+PRINT_ONLY=0
+SEED=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --print)  PRINT_ONLY=1; shift ;;
+    --seed)   SEED="${2:-}"; shift 2 ;;
+    --more)   DIM_N=5; shift ;;
+    --less)   DIM_N=2; shift ;;
+    --names)  shift ;;
+    -h|--help)
+      sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "Unknown arg: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Seed the RNG. Local entropy only — no network source.
+if [[ -n "$SEED" ]]; then
+  RNG_SEED=$SEED
+elif [[ -r /dev/urandom ]]; then
+  RNG_SEED=$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')
+else
+  RNG_SEED=$(( $(date +%s) ^ $$ ))
+fi
+
+# Detect stat flavor (BSD/macOS vs GNU/Linux).
+if stat -f %m / >/dev/null 2>&1; then
+  STAT_MTIME=( -f %m )
+else
+  STAT_MTIME=( -c %Y )
+fi
+NOW=$(date +%s)
+WEIGHTED=1
+[[ -n "$SEED" ]] && WEIGHTED=0
+
+DIMS=$(
+  find "$DIMS_DIR" -type f -name '*.md' ! -name 'README.md' ! -name '_*' \
+    | sort \
+    | while read -r f; do
+        m=$(stat "${STAT_MTIME[@]}" "$f" 2>/dev/null || echo 0)
+        printf '%s\t%s\n' "$m" "$f"
+      done \
+    | awk -F'\t' -v seed="$RNG_SEED" -v now="$NOW" -v half="$HALF_LIFE" -v weighted="$WEIGHTED" '
+        BEGIN { srand(seed) }
+        {
+          if (weighted) {
+            age = now - $1
+            if (age < 0) age = 0
+            score = rand() + exp(-age / half)   # bigger = less likely to be picked
+          } else {
+            score = rand()
+          }
+          print score "\t" $2
+        }
+      ' \
+    | sort -k1,1n \
+    | head -"$DIM_N" \
+    | cut -f2-
+)
+
+printf '=== KALEIDONYM DIMENSION-PROMPTS (this invocation) ===\n\n'
+while IFS= read -r f; do
+  [[ -n "$f" ]] && printf '  - %s\n' "$(basename "$f" .md)"
+done <<< "$DIMS"
+printf '\n=====================================================\n'
+
+if (( ! PRINT_ONLY )); then
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    printf '\n----- %s -----\n' "$(basename "$f")"
+    cat "$f"
+  done <<< "$DIMS"
+fi
+
+if [[ -z "$SEED" ]]; then
+  while IFS= read -r f; do
+    [[ -n "$f" ]] && touch "$f" 2>/dev/null || true
+  done <<< "$DIMS"
+fi
